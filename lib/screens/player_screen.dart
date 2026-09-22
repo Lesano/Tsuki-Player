@@ -2,12 +2,18 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 
-import '../main.dart';
 import '../models/song.dart';
 import '../player/audio_handler.dart';
 import '../services/music_service.dart';
+import '../theme/retro_colors.dart';
+import '../utils/sleep_timer.dart';
+import '../widgets/retro_equalizer.dart';
+import '../widgets/retro_marquee.dart';
+import '../widgets/retro_seek_bar.dart';
+import '../widgets/retro_volume.dart';
 
 enum RepeatMode {
   off,
@@ -16,7 +22,11 @@ enum RepeatMode {
 }
 
 class PlayerScreen extends StatefulWidget {
-  const PlayerScreen({super.key});
+  const PlayerScreen({super.key, this.audioHandler, this.palette});
+
+  final TsukiAudioHandler? audioHandler;
+
+  final ValueNotifier<RetroColors>? palette;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -26,6 +36,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   final MusicService musicService = MusicService();
 
   TsukiAudioHandler? audioPlayer;
+
+  late RetroColors _palette;
+
+  Color get green => _palette.primary;
+
+  Color get darkGreen => _palette.dark;
+
+  Color get darkerGreen => _palette.darker;
 
   List<Song> songs = [];
 
@@ -37,14 +55,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
   StreamSubscription<bool>? _playingSubscription;
   StreamSubscription<Duration>? _positionSubscription;
   StreamSubscription<ProcessingState>? _processingStateSubscription;
-
-  Duration position = Duration.zero;
+Duration position = Duration.zero;
   Duration duration = Duration.zero;
 
-  static const Color green = Color(0xFF4CAF50);
-  static const Color darkGreen = Color(0xFF12351A);
-  static const Color darkerGreen = Color(0xFF071B0C);
+  // ============================================================
+  // FAVORITAS
+  // ============================================================
 
+  Set<String> _favorites = {};
+  bool _favoritesOnly = false;
+  String _playlistQuery = '';
+  String _playlistOrder = 'n';
+  final TextEditingController _playlistSearchController =
+      TextEditingController();
+
+  int _resumeIndex = 0;
+  Duration? _pendingResumePosition;
+  DateTime _lastPositionSave = DateTime.fromMillisecondsSinceEpoch(0);
+
+  bool _fullscreen = false;
   // ============================================================
   // MODOS DE REPRODUÇÃO
   // ============================================================
@@ -61,6 +90,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Histórico simples do modo aleatório.
   final List<int> _shuffleHistory = [];
   int _shuffleHistoryPosition = -1;
+
+  // ============================================================
+  // VOLUME + TIMER DE DESLIGAMENTO
+  // ============================================================
+
+  double _volume = 1.0;
+
+  Timer? _sleepTimer;
+  Timer? _sleepTicker;
+  DateTime? _sleepTimerEnd;
+  int _sleepMinutes = 0;
+
+  // Fade-out do timer de desligamento.
+  bool _sleepFadeActive = false;
+  static const int _sleepFadeSteps = 10;
+  static const Duration _sleepFadeStepDuration =
+      Duration(milliseconds: 120);
+
+  int get _sleepRemainingSeconds {
+    final end = _sleepTimerEnd;
+
+    if (end == null) {
+      return 0;
+    }
+
+    final remaining = end.difference(DateTime.now()).inSeconds;
+
+    return remaining < 0 ? 0 : remaining;
+  }
 
   // ============================================================
   // MÚSICA ATUAL
@@ -86,7 +144,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void initState() {
     super.initState();
 
+    audioPlayer = widget.audioHandler;
+
+    _palette = widget.palette?.value ?? RetroColors.green;
+
+    widget.palette?.addListener(_onPaletteChanged);
+
     _initialize();
+  }
+
+  void _onPaletteChanged() {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _palette = widget.palette!.value;
+    });
   }
 
   // ============================================================
@@ -94,9 +168,63 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // ============================================================
 
   Future<void> _initialize() async {
+    await _loadVolume();
+
+    await _loadFavorites();
+
+    _resumeIndex = await musicService.getLastSongIndex();
+
+    final resumeMs = await musicService.getLastPositionMs();
+
+    _pendingResumePosition = resumeMs > 0
+        ? Duration(milliseconds: resumeMs)
+        : null;
+
     await _loadSavedMusic();
 
     await _connectAudioHandler();
+  }
+
+  // ============================================================
+  // FAVORITAS
+  // ============================================================
+
+  Future<void> _loadFavorites() async {
+    final favorites = await musicService.getFavorites();
+
+    _favorites = favorites.toSet();
+  }
+
+  Future<void> _toggleFavorite(String file) async {
+    final isFavorite = await musicService.toggleFavorite(file);
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      if (isFavorite) {
+        _favorites.add(file);
+      } else {
+        _favorites.remove(file);
+      }
+    });
+  }
+
+  // ============================================================
+  // VOLUME
+  // ============================================================
+
+  Future<void> _loadVolume() async {
+    final volume = await musicService.getVolume();
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _volume = volume;
+    });
   }
 
   // ============================================================
@@ -104,33 +232,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // ============================================================
 
   Future<void> _connectAudioHandler() async {
-    // Espera pelo AudioService por no máximo 5 segundos.
-    for (int i = 0; i < 100; i++) {
-      if (audioHandler != null) {
-        break;
-      }
-
-      await Future.delayed(const Duration(milliseconds: 50));
-
-      if (!mounted) {
-        return;
-      }
-    }
-
-    if (!mounted) {
+    if (audioPlayer == null) {
       return;
     }
-
-    // Verifica se o AudioHandler existe.
-    if (audioHandler == null) {
-      return;
-    }
-
-    // ==========================================================
-    // LIGA O HANDLER
-    // ==========================================================
-
-    audioPlayer = audioHandler;
 
     // ==========================================================
     // CONTROLOS DA NOTIFICAÇÃO
@@ -172,6 +276,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
           duration = currentDuration;
         }
       });
+
+      // Guarda a posição a cada ~5s para retomar depois.
+      if (newPosition.inSeconds > 0 &&
+          DateTime.now().difference(_lastPositionSave).inSeconds >= 5) {
+        _lastPositionSave = DateTime.now();
+
+        musicService.saveLastPositionMs(newPosition.inMilliseconds);
+      }
     });
 
     // ==========================================================
@@ -182,18 +294,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       state,
     ) async {
       if (state == ProcessingState.completed) {
-
         await _nextSong(automatic: true);
       }
     });
 
     // ==========================================================
-    // CARREGAR MÚSICA ATUAL
+    // VOLUME GUARDADO
     // ==========================================================
 
-    if (songs.isNotEmpty) {
-      await _loadCurrentSong();
-    }
+    await audioPlayer!.setVolume(_volume);
   }
 
   // ============================================================
@@ -201,8 +310,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // ============================================================
 
   Future<void> _loadSavedMusic() async {
+    List<Song> loadedSongs;
 
-    final loadedSongs = await musicService.loadSavedMusic();
+    try {
+      loadedSongs = await musicService.loadSavedMusic();
+    } catch (e) {
+      // Permissão removida ou pasta inacessível.
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        songs = [];
+        isLoading = false;
+      });
+
+      _showError('Não foi possível abrir a pasta guardada.');
+      return;
+    }
 
     if (!mounted) {
       return;
@@ -210,13 +335,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     setState(() {
       songs = loadedSongs;
-      currentSongIndex = 0;
+      currentSongIndex = _resumeIndex < songs.length ? _resumeIndex : 0;
       isLoading = false;
     });
-
-
-    for (int i = 0; i < songs.length; i++) {
-    }
 
     // Caso o AudioHandler já esteja disponível.
     if (songs.isNotEmpty && audioPlayer != null) {
@@ -233,7 +354,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
       isLoading = true;
     });
 
-    final loadedSongs = await musicService.chooseMusicFolder();
+    List<Song> loadedSongs;
+
+    try {
+      loadedSongs = await musicService.chooseMusicFolder();
+    } catch (e) {
+      // Falha ao abrir a SAF ou a ler a pasta.
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        isLoading = false;
+      });
+
+      _showError('Não foi possível ler a pasta selecionada.');
+      return;
+    }
 
     if (!mounted) {
       return;
@@ -245,8 +382,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       isLoading = false;
     });
 
+    _pendingResumePosition = null;
+
+    await musicService.saveLastSongIndex(0);
+
+    await musicService.saveLastPositionMs(0);
+
     if (songs.isNotEmpty && audioPlayer != null) {
       await _loadCurrentSong();
+
+      // Ao escolher uma pasta nova, a primeira música toca automaticamente.
+      await audioPlayer!.play();
     }
   }
 
@@ -262,6 +408,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
 
     try {
+      // Para a faixa atual antes de trocar, evitando bug
+      // ao carregar a nova música (playlist, anterior, seguinte, pasta).
+      if (audioPlayer!.playing) {
+        await audioPlayer!.pause();
+      }
 
       // ========================================================
       // METADATA + CAPA
@@ -274,6 +425,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
           await musicService.prepareSong(song);
 
       _preparedSongs[song.file] = preparedSong;
+
+      // Mantém o cache limitado para não crescer sem limite.
+      if (_preparedSongs.length > 60) {
+        _preparedSongs.remove(_preparedSongs.keys.first);
+      }
 
       if (!mounted) {
         return;
@@ -289,6 +445,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
       // ========================================================
 
       await audioPlayer!.setFilePath(preparedSong.file);
+
+      // ========================================================
+      // RETOMAR ONDE PAROU
+      // ========================================================
+
+      final resumePosition = _pendingResumePosition;
+
+      _pendingResumePosition = null;
+
+      _lastPositionSave = DateTime.fromMillisecondsSinceEpoch(0);
+
+      if (resumePosition != null) {
+        await audioPlayer!.seek(resumePosition);
+
+        await musicService.saveLastPositionMs(resumePosition.inMilliseconds);
+      } else {
+        // Nova música: nunca herdar a posição da faixa anterior.
+        await musicService.saveLastPositionMs(0);
+      }
+
+      await musicService.saveLastSongIndex(currentSongIndex);
 
       // ========================================================
       // ATUALIZAR NOTIFICAÇÃO
@@ -307,11 +484,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
       setState(() {
         duration = audioPlayer!.duration ?? Duration.zero;
-        position = Duration.zero;
+        position = resumePosition ?? Duration.zero;
       });
 
     } catch (e) {
-      // Ignore individual track loading failures and keep the player usable.
+      // Mantém o player utilizável e avisa o utilizador.
+      if (mounted) {
+        _showError('Não foi possível carregar "${song.title}".');
+      }
     }
   }
 
@@ -324,8 +504,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
 
-    Navigator.of(context).pop();
-
+    // O toque na linha da playlist já fechou o sheet com pop();
+    // aqui só troca de faixa para não fechar a tela (root) a mais.
     setState(() {
       currentSongIndex = index;
     });
@@ -346,11 +526,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (audioPlayer!.playing) {
         await audioPlayer!.pause();
       } else {
+        // Retomar: devolve o volume original (ex.: após fade-out).
+        await audioPlayer!.setVolume(_volume);
+
         await audioPlayer!.play();
       }
     } catch (e) {
-      // Ignore playback errors; the audio handler remains available.
+      // O handler continua disponível; apenas informa o utilizador.
+      if (mounted) {
+        _showError('Não foi possível reproduzir a música.');
+      }
     }
+  }
+
+  // ============================================================
+  // FEEDBACK DE ERROS
+  // ============================================================
+
+  void _showError(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            message,
+            style: const TextStyle(fontFamily: 'Minecraftia'),
+          ),
+          backgroundColor: darkGreen,
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 3),
+        ),
+      );
   }
 
   // ============================================================
@@ -486,8 +696,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }
 
-    final wasPlaying = audioPlayer!.playing;
-
     if (mounted) {
       setState(() {
         currentSongIndex = nextIndex;
@@ -496,16 +704,536 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     await _loadCurrentSong();
 
-    // Próxima faixa toca automaticamente.
-    // Se foi uma troca manual, também mantém o comportamento atual.
-    if (automatic || wasPlaying || !automatic) {
-      await audioPlayer!.play();
-    }
+    // A próxima faixa toca automaticamente.
+    await audioPlayer!.play();
   }
 
   // ============================================================
   // MODOS
   // ============================================================
+
+  void _volumeChanged(double value) {
+    setState(() {
+      _volume = value;
+    });
+  }
+
+  Future<void> _volumeChangeEnd(double value) async {
+    _volume = value;
+
+    await audioPlayer?.setVolume(value);
+
+    await musicService.saveVolume(value);
+  }
+
+  // ============================================================
+  // TIMER DE DESLIGAMENTO
+  // ============================================================
+
+  void _setSleepTimer(int minutes) {
+    // Cancela qualquer fade-out em andamento (restaura o volume).
+    _sleepFadeActive = false;
+
+    _sleepTimer?.cancel();
+    _sleepTicker?.cancel();
+
+    setState(() {
+      _sleepMinutes = minutes;
+      _sleepTimerEnd = minutes > 0
+          ? DateTime.now().add(Duration(minutes: minutes))
+          : null;
+    });
+
+    if (minutes <= 0) {
+      return;
+    }
+
+    _sleepTimer = Timer(
+      Duration(minutes: minutes),
+      _onSleepTimerFinished,
+    );
+
+    // Atualiza o contador ao lado da lua a cada segundo.
+    _sleepTicker = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        if (!mounted) {
+          return;
+        }
+
+        if (_sleepRemainingSeconds <= 0) {
+          _onSleepTimerFinished();
+          return;
+        }
+
+        setState(() {});
+      },
+    );
+
+    _showSleepSnackBar('☾ Timer ligado · $minutes MIN');
+  }
+
+  void _showSleepSnackBar(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            message,
+            style: const TextStyle(fontFamily: 'Minecraftia'),
+          ),
+          backgroundColor: darkGreen,
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+  }
+
+  String _sleepTimerLabel() {
+    final s = _sleepRemainingSeconds;
+    final m = s ~/ 60;
+    final sec = (s % 60).toString().padLeft(2, '0');
+
+    return '$m:$sec';
+  }
+
+  Widget _sleepTimerButton({double iconSize = 21, double splashRadius = 22}) {
+    final active = _sleepMinutes > 0;
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          onPressed: _showSleepTimerPicker,
+          tooltip: 'Timer de desligamento',
+          splashRadius: splashRadius,
+          icon: Icon(
+            Icons.bedtime,
+            size: iconSize,
+            color: active ? green : green.withAlpha(85),
+          ),
+        ),
+        if (active) ...[
+          const SizedBox(width: 2),
+          Text(
+            _sleepTimerLabel(),
+            style: TextStyle(
+              fontFamily: 'Minecraftia',
+              color: green.withAlpha(220),
+              fontSize: 7,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _onSleepTimerFinished() async {
+    _sleepTimer?.cancel();
+    _sleepTicker?.cancel();
+
+    final player = audioPlayer;
+
+    // Toca: faz fade-out suave antes de pausar, como num MP3 player.
+    if (player != null && player.playing) {
+      await _runSleepFadeOut();
+      return;
+    }
+
+    // Já pausado: apenas reinicia o estado.
+    await player?.pause();
+
+    _resetSleepState();
+  }
+
+  Future<void> _runSleepFadeOut() async {
+    final originalVolume = _volume;
+    final player = audioPlayer;
+
+    _sleepFadeActive = true;
+
+    var step = _sleepFadeSteps;
+
+    while (mounted && _sleepFadeActive && step > 0) {
+      await player?.setVolume(
+        fadeTargetVolume(originalVolume, step, _sleepFadeSteps),
+      );
+
+      step--;
+
+      if (step > 0 && _sleepFadeActive) {
+        await Future.delayed(_sleepFadeStepDuration);
+      }
+    }
+
+    // Fim do fade: pausa no volume 0 e só então restaura o volume original,
+    // para o ouvinte não ouvir a música "voltar ao normal" antes de parar.
+    if (step <= 0) {
+      await player?.setVolume(0.0);
+      await player?.pause();
+    }
+
+    // Restaura o volume original (silencioso, já pausado).
+    await player?.setVolume(originalVolume);
+
+    _sleepFadeActive = false;
+
+    // Só reinicia o estado se o fade chegou ao fim sem interrupção.
+    if (step <= 0) {
+      _resetSleepState();
+    }
+  }
+
+  void _resetSleepState() {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _sleepMinutes = 0;
+      _sleepTimerEnd = null;
+    });
+
+    _showSleepSnackBar('ZZZ · Timer desligado');
+  }
+
+  void _showSleepTimerPicker() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return Container(
+          decoration: BoxDecoration(
+            color: Colors.black,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+            border: Border(
+              top: BorderSide(color: green, width: 2),
+              left: BorderSide(color: green, width: 1),
+              right: BorderSide(color: green, width: 1),
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 10),
+
+              Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: green,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              Text(
+                'TIMER DE DESLIGAMENTO',
+                style: TextStyle(
+                  fontFamily: 'Minecraftia',
+                  color: green,
+                  fontSize: 15,
+                  letterSpacing: 1,
+                ),
+              ),
+
+              const SizedBox(height: 6),
+
+              Text(
+                _sleepMinutes > 0
+                    ? 'PARA EM $_sleepMinutes MIN'
+                    : 'DESLIGADO',
+                style: TextStyle(
+                  fontFamily: 'Minecraftia',
+                  color: green.withAlpha(160),
+                  fontSize: 8,
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              for (final option in _sleepOptions)
+                _sleepOptionTile(option: option),
+
+              _customSleepOptionTile(),
+
+              const SizedBox(height: 18),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  static const List<(int, String)> _sleepOptions = [
+    (0, 'DESLIGAR'),
+    (5, '5 MIN'),
+    (15, '15 MIN'),
+    (30, '30 MIN'),
+    (60, '60 MIN'),
+  ];
+
+  Widget _sleepOptionTile({required (int, String) option}) {
+    final minutes = option.$1;
+    final label = option.$2;
+    final active = minutes == _sleepMinutes;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(11),
+          onTap: () {
+            Navigator.of(context).pop();
+
+            _setSleepTimer(minutes);
+          },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 12,
+            ),
+            decoration: BoxDecoration(
+              color: active ? darkGreen : Colors.transparent,
+              borderRadius: BorderRadius.circular(11),
+              border: Border.all(
+                color: active ? green : green.withAlpha(35),
+                width: active ? 1.5 : 1,
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.bedtime, color: green, size: 16),
+
+                const SizedBox(width: 12),
+
+                Expanded(
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      fontFamily: 'Minecraftia',
+                      color: green,
+                      fontSize: 9,
+                    ),
+                  ),
+                ),
+
+                if (active)
+                  Icon(Icons.play_arrow, color: green, size: 14),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _customSleepOptionTile() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(11),
+          onTap: () {
+            Navigator.of(context).pop();
+
+            _showCustomSleepTimer();
+          },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 12,
+            ),
+            decoration: BoxDecoration(
+              color: Colors.transparent,
+              borderRadius: BorderRadius.circular(11),
+              border: Border.all(color: green.withAlpha(90), width: 1),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.edit, color: green, size: 16),
+
+                SizedBox(width: 12),
+
+                Expanded(
+                  child: Text(
+                    'PERSONALIZADO...',
+                    style: TextStyle(
+                      fontFamily: 'Minecraftia',
+                      color: green,
+                      fontSize: 9,
+                    ),
+                  ),
+                ),
+
+                Icon(Icons.keyboard_arrow_right, color: green, size: 16),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showCustomSleepTimer() {
+    // Começa do valor actual ou de 15 por defeito. Sem teclado:
+    // o número é escolhido com os botões +/-, evitando o overlay
+    // que aparecia ao abrir o teclado.
+    var minutes = _sleepMinutes > 0 ? _sleepMinutes : 15;
+
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          backgroundColor: Colors.black,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(color: green, width: 1.5),
+          ),
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 28,
+            vertical: 24,
+          ),
+          child: StatefulBuilder(
+            builder: (context, setDialogState) {
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'TIMER PERSONALIZADO',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontFamily: 'Minecraftia',
+                        color: green,
+                        fontSize: 12,
+                      ),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        _stepperButton(
+                          icon: Icons.remove,
+                          onPressed: () {
+                            setDialogState(() {
+                              minutes = minutes > 1 ? minutes - 1 : 1;
+                            });
+                          },
+                        ),
+                        Container(
+                          width: 64,
+                          margin: const EdgeInsets.symmetric(horizontal: 12),
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          decoration: BoxDecoration(
+                            color: darkGreen,
+                            border: Border.all(color: green, width: 1.5),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '$minutes',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontFamily: 'Minecraftia',
+                              color: green,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ),
+                        _stepperButton(
+                          icon: Icons.add,
+                          onPressed: () {
+                            setDialogState(() {
+                              minutes = minutes < 120 ? minutes + 1 : 120;
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    Text(
+                      '1 A 120 MIN',
+                      style: TextStyle(
+                        fontFamily: 'Minecraftia',
+                        color: green.withAlpha(160),
+                        fontSize: 7,
+                      ),
+                    ),
+
+                    const SizedBox(height: 10),
+
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextButton(
+                            onPressed: () => Navigator.of(context).pop(),
+                            child: Text(
+                              'CANCELAR',
+                              style: TextStyle(
+                                fontFamily: 'Minecraftia',
+                                color: green,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: TextButton(
+                            onPressed: () {
+                              Navigator.of(context).pop();
+
+                              _setSleepTimer(minutes);
+                            },
+                            child: Text(
+                              'COMEÇAR',
+                              style: TextStyle(
+                                fontFamily: 'Minecraftia',
+                                color: green,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _stepperButton({required IconData icon, required VoidCallback onPressed}) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onPressed,
+        child: Container(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            color: darkGreen,
+            border: Border.all(color: green, width: 1.5),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Icon(icon, color: green, size: 22),
+        ),
+      ),
+    );
+  }
 
   void _toggleShuffle() {
     if (!mounted) {
@@ -571,23 +1299,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   // ============================================================
-  // FORMATAR TEMPO
-  // ============================================================
-
-  String _formatTime(Duration time) {
-    final minutes = time.inMinutes.remainder(60).toString().padLeft(2, '0');
-
-    final seconds = time.inSeconds.remainder(60).toString().padLeft(2, '0');
-
-    return '$minutes:$seconds';
-  }
-
-  // ============================================================
   // DISPOSE
   // ============================================================
 
   @override
   void dispose() {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+
+    widget.palette?.removeListener(_onPaletteChanged);
+
+    _playlistSearchController.dispose();
+
+    final lastPosition = position;
+
+    if (lastPosition.inMilliseconds > 0) {
+      musicService.saveLastPositionMs(lastPosition.inMilliseconds);
+    }
+
+    _sleepTimer?.cancel();
+
+    _sleepTicker?.cancel();
+
     _playingSubscription?.cancel();
 
     _positionSubscription?.cancel();
@@ -612,9 +1344,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    return isLandscape
+    final player = isLandscape
         ? _buildLandscapePlayer(song)
         : _buildPlayer(song);
+
+    return Stack(
+      children: [
+        player,
+        if (_fullscreen) _buildFullscreen(song),
+      ],
+    );
   }
 
   // ============================================================
@@ -663,55 +1402,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Container(
-                        width: coverSize,
-                        height: coverSize,
-                        padding: const EdgeInsets.all(4),
-                        decoration: BoxDecoration(
-                          color: green,
-                          borderRadius: BorderRadius.circular(20),
-                          boxShadow: [
-                            BoxShadow(
-                              color: green.withAlpha(35),
-                              blurRadius: 18,
-                              spreadRadius: 1,
-                            ),
-                          ],
-                        ),
-                        child: Container(
-                          padding: const EdgeInsets.all(2),
-                          decoration: BoxDecoration(
-                            color: Colors.black,
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(13),
-                            child: song.cover != null
-                                ? Image.memory(
-                                    song.cover!,
-                                    fit: BoxFit.cover,
-                                    filterQuality: FilterQuality.medium,
-                                  )
-                                : const Center(
-                                    child: Icon(
-                                      Icons.music_note,
-                                      color: green,
-                                      size: 60,
-                                    ),
-                                  ),
-                          ),
-                        ),
+                      _albumCover(
+                        size: coverSize,
+                        song: song,
+                        active: green,
+                        showAction: true,
+                        onTap: _toggleFullscreen,
                       ),
 
                       const SizedBox(height: 12),
 
-                      // MÚSICAS / PLAYLIST ficam ligados à capa.
+                      // MÚSICAS / PLAYLIST / TEMA ficam ligados à capa.
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           _folderButton(compact: true),
-                          const SizedBox(width: 10),
+                          const SizedBox(width: 8),
                           _playlistButton(compact: true),
+                          const SizedBox(width: 8),
+                          _themeButton(compact: true),
                         ],
                       ),
                     ],
@@ -730,7 +1439,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text(
+                          Text(
                             'TSUKI PLAYER',
                             style: TextStyle(
                               fontFamily: 'Minecraftia',
@@ -741,18 +1450,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           ),
                           Row(
                             children: [
-                              Container(
-                                width: 7,
-                                height: 7,
-                                decoration: BoxDecoration(
-                                  color: isPlaying ? green : darkGreen,
-                                  shape: BoxShape.circle,
-                                ),
+                              RetroEqualizer(
+                                playing: isPlaying,
+                                maxHeight: 10,
+                                spacing: 2,
+                                color: green,
                               ),
                               const SizedBox(width: 7),
                               Text(
                                 isPlaying ? 'A TOCAR AGORA' : 'EM PAUSA',
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontFamily: 'Minecraftia',
                                   color: green,
                                   fontSize: 8,
@@ -770,24 +1477,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         padding: const EdgeInsets.symmetric(horizontal: 12),
                         child: Column(
                           children: [
-                            Text(
-                              song.title,
-                              textAlign: TextAlign.center,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                            RetroMarquee(
+                              text: song.title,
+                              active: isPlaying,
+                              style: TextStyle(
                                 fontFamily: 'Minecraftia',
                                 color: green,
                                 fontSize: 13,
-                                height: 1.5,
                               ),
                             ),
                             const SizedBox(height: 5),
-                            Text(
-                              song.artist,
-                              textAlign: TextAlign.center,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                            RetroMarquee(
+                              text: song.artist,
+                              active: isPlaying,
                               style: TextStyle(
                                 fontFamily: 'Minecraftia',
                                 color: green.withAlpha(190),
@@ -873,7 +1575,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                   : green.withAlpha(85),
                             ),
                           ),
+                          const SizedBox(width: 4),
+                          _sleepTimerButton(iconSize: 20, splashRadius: 20),
                         ],
+                      ),
+
+                      const SizedBox(height: 3),
+
+                      RetroVolumeControl(
+                        volume: _volume,
+                        onChanged: _volumeChanged,
+                        onChangeEnd: _volumeChangeEnd,
+                        color: green,
                       ),
 
                       const Spacer(flex: 2),
@@ -881,106 +1594,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       // SEEKBAR
                       Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 4),
-                        child: Row(
-                          children: [
-                            SizedBox(
-                              width: 48,
-                              child: Text(
-                                _formatTime(position),
-                                style: const TextStyle(
-                                  fontFamily: 'Minecraftia',
-                                  color: green,
-                                  fontSize: 8,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: LayoutBuilder(
-                                builder: (context, barConstraints) {
-                                  final total = duration.inMilliseconds;
-                                  final progress = total > 0
-                                      ? (position.inMilliseconds / total)
-                                          .clamp(0.0, 1.0)
-                                      : 0.0;
-
-                                  void seekFromOffset(double dx) {
-                                    if (total <= 0 ||
-                                        barConstraints.maxWidth <= 0) {
-                                      return;
-                                    }
-
-                                    final percentage =
-                                        (dx / barConstraints.maxWidth)
-                                            .clamp(0.0, 1.0);
-
-                                    _seek(
-                                      Duration(
-                                        milliseconds:
-                                            (total * percentage).round(),
-                                      ),
-                                    );
-                                  }
-
-                                  return GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTapDown: (details) => seekFromOffset(
-                                      details.localPosition.dx,
-                                    ),
-                                    onHorizontalDragStart: (details) =>
-                                        seekFromOffset(
-                                      details.localPosition.dx,
-                                    ),
-                                    onHorizontalDragUpdate: (details) =>
-                                        seekFromOffset(
-                                      details.localPosition.dx,
-                                    ),
-                                    child: Container(
-                                      height: 26,
-                                      padding: const EdgeInsets.all(4),
-                                      decoration: BoxDecoration(
-                                        color: Colors.black,
-                                        border: Border.all(
-                                          color: green,
-                                          width: 3,
-                                        ),
-                                        borderRadius: BorderRadius.circular(2),
-                                      ),
-                                      child: LayoutBuilder(
-                                        builder: (context, inner) {
-                                          return Stack(
-                                            clipBehavior: Clip.hardEdge,
-                                            children: [
-                                              Positioned(
-                                                left: 0,
-                                                top: 0,
-                                                bottom: 0,
-                                                width: inner.maxWidth * progress,
-                                                child: Container(color: green),
-                                              ),
-                                            ],
-                                          );
-                                        },
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            SizedBox(
-                              width: 48,
-                              child: Text(
-                                _formatTime(duration),
-                                textAlign: TextAlign.right,
-                                style: const TextStyle(
-                                  fontFamily: 'Minecraftia',
-                                  color: green,
-                                  fontSize: 8,
-                                ),
-                              ),
-                            ),
-                          ],
+                        child: RetroSeekBar(
+                          position: position,
+                          duration: duration,
+                          onSeek: _seek,
+                          labelWidth: 48,
+                          barHeight: 26,
+                          color: green,
                         ),
                       ),
                     ],
@@ -1003,11 +1623,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Icon(Icons.music_note, color: green, size: 58),
+          Icon(Icons.music_note, color: green, size: 58),
 
           const SizedBox(height: 18),
 
-          const Text(
+          Text(
             'TSUKI PLAYER',
             style: TextStyle(
               fontFamily: 'Minecraftia',
@@ -1018,7 +1638,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 10),
 
-          const Text(
+          Text(
             'NENHUMA MÚSICA',
             style: TextStyle(
               fontFamily: 'Minecraftia',
@@ -1032,7 +1652,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Text(
             isLoading ? 'A PROCURAR MÚSICAS...' : 'ESCOLHE UMA PASTA',
             textAlign: TextAlign.center,
-            style: const TextStyle(
+            style: TextStyle(
               fontFamily: 'Minecraftia',
               color: green,
               fontSize: 8,
@@ -1075,7 +1695,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 // ==================================================
                 // HEADER
                 // ==================================================
-                const Text(
+                Text(
                   'TSUKI PLAYER',
                   textAlign: TextAlign.center,
                   style: TextStyle(
@@ -1091,18 +1711,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Container(
-                      width: 7,
-                      height: 7,
-                      decoration: BoxDecoration(
-                        color: isPlaying ? green : darkGreen,
-                        shape: BoxShape.circle,
-                      ),
+                    RetroEqualizer(
+                      playing: isPlaying,
+                      maxHeight: 10,
+                      spacing: 2,
+                      color: green,
                     ),
                     const SizedBox(width: 7),
                     Text(
                       isPlaying ? 'A TOCAR AGORA' : 'EM PAUSA',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontFamily: 'Minecraftia',
                         color: green,
                         fontSize: 8,
@@ -1116,46 +1734,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 // ==================================================
                 const Spacer(flex: 1),
 
-                Container(
-                  width: coverSize + 14,
-                  height: coverSize + 14,
-                  padding: const EdgeInsets.all(4),
-                  decoration: BoxDecoration(
-                    color: green,
-                    borderRadius: BorderRadius.circular(22),
-                    boxShadow: [
-                      BoxShadow(
-                        color: green.withAlpha(35),
-                        blurRadius: 18,
-                        spreadRadius: 1,
-                      ),
-                    ],
-                  ),
-                  child: Container(
-                    padding: const EdgeInsets.all(2),
-                    decoration: BoxDecoration(
-                      color: Colors.black,
-                      borderRadius: BorderRadius.circular(17),
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(14),
-                      child: song.cover != null
-                          ? Image.memory(
-                              song.cover!,
-                              width: coverSize,
-                              height: coverSize,
-                              fit: BoxFit.cover,
-                              filterQuality: FilterQuality.medium,
-                            )
-                          : const Center(
-                              child: Icon(
-                                Icons.music_note,
-                                color: green,
-                                size: 65,
-                              ),
-                            ),
-                    ),
-                  ),
+                _albumCover(
+                  size: coverSize,
+                  song: song,
+                  active: green,
+                  showAction: true,
+                  onTap: _toggleFullscreen,
+                  iconSize: 65,
                 ),
 
                 const SizedBox(height: 11),
@@ -1164,24 +1749,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: 14),
                   child: Column(
                     children: [
-                      Text(
-                        song.title,
-                        textAlign: TextAlign.center,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                      RetroMarquee(
+                        text: song.title,
+                        active: isPlaying,
+                        style: TextStyle(
                           fontFamily: 'Minecraftia',
                           color: green,
                           fontSize: 12,
-                          height: 1.5,
                         ),
                       ),
                       const SizedBox(height: 5),
-                      Text(
-                        song.artist,
-                        textAlign: TextAlign.center,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
+                      RetroMarquee(
+                        text: song.artist,
+                        active: isPlaying,
                         style: TextStyle(
                           fontFamily: 'Minecraftia',
                           color: green.withAlpha(190),
@@ -1248,120 +1828,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 // ==================================================
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 8),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      SizedBox(
-                        width: 54,
-                        child: Text(
-                          _formatTime(position),
-                          style: const TextStyle(
-                            fontFamily: 'Minecraftia',
-                            color: green,
-                            fontSize: 8,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: LayoutBuilder(
-                          builder: (context, barConstraints) {
-                            final total = duration.inMilliseconds;
-                            final progress = total > 0
-                                ? (position.inMilliseconds / total)
-                                    .clamp(0.0, 1.0)
-                                : 0.0;
-
-                            void seekFromOffset(double dx) {
-                              if (total <= 0 ||
-                                  barConstraints.maxWidth <= 0) {
-                                return;
-                              }
-
-                              final percentage =
-                                  (dx / barConstraints.maxWidth)
-                                      .clamp(0.0, 1.0);
-
-                              _seek(
-                                Duration(
-                                  milliseconds:
-                                      (total * percentage).round(),
-                                ),
-                              );
-                            }
-
-                            return GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onTapDown: (details) => seekFromOffset(
-                                details.localPosition.dx,
-                              ),
-                              onHorizontalDragStart: (details) =>
-                                  seekFromOffset(
-                                details.localPosition.dx,
-                              ),
-                              onHorizontalDragUpdate: (details) =>
-                                  seekFromOffset(
-                                details.localPosition.dx,
-                              ),
-                              child: Container(
-                                height: 28,
-                                padding: const EdgeInsets.all(4),
-                                decoration: BoxDecoration(
-                                  color: Colors.black,
-                                  border: Border.all(
-                                    color: green,
-                                    width: 3,
-                                  ),
-                                  borderRadius: BorderRadius.circular(2),
-                                ),
-                                child: LayoutBuilder(
-                                  builder: (context, inner) {
-                                    return Stack(
-                                      clipBehavior: Clip.hardEdge,
-                                      children: [
-                                        Positioned(
-                                          left: 0,
-                                          top: 0,
-                                          bottom: 0,
-                                          width: inner.maxWidth * progress,
-                                          child: Container(
-                                            decoration: BoxDecoration(
-                                              color: green,
-                                              borderRadius:
-                                                  BorderRadius.circular(1),
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    );
-                                  },
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      SizedBox(
-                        width: 54,
-                        child: Text(
-                          _formatTime(duration),
-                          textAlign: TextAlign.right,
-                          style: const TextStyle(
-                            fontFamily: 'Minecraftia',
-                            color: green,
-                            fontSize: 8,
-                          ),
-                        ),
-                      ),
-                    ],
+                  child: RetroSeekBar(
+                    position: position,
+                    duration: duration,
+                    onSeek: _seek,
+                    labelWidth: 54,
+                    barHeight: 28,
+                    color: green,
                   ),
                 ),
 
                 const SizedBox(height: 6),
 
                 // ==================================================
-                // ALEATÓRIO + REPETIR
+                // ALEATÓRIO + REPETIR + TIMER
                 // ==================================================
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -1395,11 +1875,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             : green.withAlpha(85),
                       ),
                     ),
+                    const SizedBox(width: 8),
+                    _sleepTimerButton(),
                   ],
                 ),
 
+                const SizedBox(height: 2),
+
+                RetroVolumeControl(
+                  volume: _volume,
+                  onChanged: _volumeChanged,
+                  onChangeEnd: _volumeChangeEnd,
+                  color: green,
+                ),
+
                 if (isLoading)
-                  const Padding(
+                  Padding(
                     padding: EdgeInsets.only(top: 0),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -1434,8 +1925,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     _folderButton(compact: true),
-                    const SizedBox(width: 9),
+                    const SizedBox(width: 7),
                     _playlistButton(compact: true),
+                    const SizedBox(width: 7),
+                    _themeButton(compact: true),
                   ],
                 ),
 
@@ -1452,192 +1945,478 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // PLAYLIST
   // ============================================================
 
-  void _showPlaylist() {
-    showModalBottomSheet(
+void _showPlaylist() {
+    showModalBottomSheet<void>(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (context) {
-        return Container(
-          height: MediaQuery.of(context).size.height * 0.76,
-          decoration: const BoxDecoration(
-            color: Colors.black,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
-            border: Border(
-              top: BorderSide(color: green, width: 2),
-              left: BorderSide(color: green, width: 1),
-              right: BorderSide(color: green, width: 1),
-            ),
-          ),
-          child: Column(
-            children: [
-              const SizedBox(height: 10),
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final ownedSongs = _favoritesOnly
+                ? songs.where((s) => _favorites.contains(s.file)).toList()
+                : songs;
 
-              // HANDLE
-              Container(
-                width: 42,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: green,
-                  borderRadius: BorderRadius.circular(10),
+            final query = _playlistQuery.trim().toLowerCase();
+
+            var visibleSongs = query.isEmpty
+                ? ownedSongs
+                : ownedSongs
+                    .where((s) =>
+                        s.title.toLowerCase().contains(query) ||
+                        s.artist.toLowerCase().contains(query))
+                    .toList();
+
+            if (_playlistOrder == 'a') {
+              visibleSongs = [...visibleSongs]
+                ..sort((a, b) => a.title.toLowerCase().compareTo(
+                    b.title.toLowerCase()));
+            } else if (_playlistOrder == 'd') {
+              visibleSongs = [...visibleSongs]
+                ..sort((a, b) => a.duration.compareTo(b.duration));
+            }
+
+            return Container(
+              height: MediaQuery.of(context).size.height * 0.76,
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+                border: Border(
+                  top: BorderSide(color: green, width: 2),
+                  left: BorderSide(color: green, width: 1),
+                  right: BorderSide(color: green, width: 1),
                 ),
               ),
-
-              const SizedBox(height: 16),
-
-              // CABEÇALHO
-              const Text(
-                'PLAYLIST',
-                style: TextStyle(
-                  fontFamily: 'Minecraftia',
-                  color: green,
-                  fontSize: 17,
-                  letterSpacing: 1,
-                ),
-              ),
-
-              const SizedBox(height: 6),
-
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+              child: Column(
                 children: [
-                  const Icon(Icons.library_music, color: green, size: 14),
+                  const SizedBox(height: 10),
 
-                  const SizedBox(width: 6),
+                  // HANDLE
+                  Container(
+                    width: 42,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: green,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
 
+                  const SizedBox(height: 16),
+
+                  // CABEÇALHO
                   Text(
-                    '${songs.length} MÚSICAS',
+                    'PLAYLIST',
                     style: TextStyle(
                       fontFamily: 'Minecraftia',
-                      color: green.withAlpha(160),
-                      fontSize: 8,
+                      color: green,
+                      fontSize: 17,
+                      letterSpacing: 1,
                     ),
+                  ),
+
+                  const SizedBox(height: 6),
+
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.library_music, color: green, size: 14),
+
+                      const SizedBox(width: 6),
+
+                      Text(
+                        '${visibleSongs.length} MÚSICAS · ${_playlistTotalDuration()}',
+                        style: TextStyle(
+                          fontFamily: 'Minecraftia',
+                          color: green.withAlpha(160),
+                          fontSize: 8,
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // FILTRO: TODAS / FAVORITAS
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      _playlistFilterChip(
+                        label: 'TODAS',
+                        active: !_favoritesOnly,
+                        onPressed: () {
+                          setSheetState(() {
+                            _favoritesOnly = false;
+                          });
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                      _playlistFilterChip(
+                        label: 'FAVORITAS ★',
+                        active: _favoritesOnly,
+                        onPressed: () {
+                          setSheetState(() {
+                            _favoritesOnly = true;
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 10),
+
+                  // ORDENAÇÃO
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      _playlistFilterChip(
+                        label: 'Nº',
+                        active: _playlistOrder == 'n',
+                        onPressed: () {
+                          setSheetState(() {
+                            _playlistOrder = 'n';
+                          });
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                      _playlistFilterChip(
+                        label: 'A-Z',
+                        active: _playlistOrder == 'a',
+                        onPressed: () {
+                          setSheetState(() {
+                            _playlistOrder = 'a';
+                          });
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                      _playlistFilterChip(
+                        label: 'DURAÇÃO',
+                        active: _playlistOrder == 'd',
+                        onPressed: () {
+                          setSheetState(() {
+                            _playlistOrder = 'd';
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 10),
+
+                  // BUSCA
+                  Container(
+                    height: 34,
+                    margin: const EdgeInsets.symmetric(horizontal: 18),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.transparent,
+                      borderRadius: BorderRadius.circular(9),
+                      border: Border.all(
+                        color: _playlistQuery.isEmpty
+                            ? green.withAlpha(70)
+                            : green,
+                        width: _playlistQuery.isEmpty ? 1 : 1.5,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.search, size: 15, color: green),
+                        const SizedBox(width: 7),
+                        Expanded(
+                          child: TextField(
+                            controller: _playlistSearchController,
+                            style: TextStyle(
+                              fontFamily: 'Minecraftia',
+                              color: green,
+                              fontSize: 10,
+                            ),
+                            cursorColor: green,
+                            decoration: InputDecoration(
+                              border: InputBorder.none,
+                              isDense: true,
+                              hintText: 'BUSCAR MÚSICA OU ARTISTA',
+                              hintStyle: TextStyle(
+                                fontFamily: 'Minecraftia',
+                                color: green.withAlpha(80),
+                                fontSize: 9,
+                              ),
+                            ),
+                            onChanged: (value) {
+                              setSheetState(() {
+                                _playlistQuery = value;
+                              });
+                            },
+                          ),
+                        ),
+                        if (_playlistQuery.isNotEmpty)
+                          InkWell(
+                            onTap: () {
+                              _playlistSearchController.clear();
+
+                              setSheetState(() {
+                                _playlistQuery = '';
+                              });
+                            },
+                            child: Icon(
+                              Icons.close,
+                              size: 15,
+                              color: green.withAlpha(150),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // LISTA
+                  Expanded(
+                    child: visibleSongs.isEmpty
+                        ? Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  query.isNotEmpty
+                                      ? Icons.search_off
+                                      : Icons.star_border,
+                                  color: green.withAlpha(90),
+                                  size: 34,
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  query.isNotEmpty
+                                      ? 'SEM RESULTADOS'
+                                      : 'SEM FAVORITAS AINDA',
+                                  style: TextStyle(
+                                    fontFamily: 'Minecraftia',
+                                    color: green.withAlpha(160),
+                                    fontSize: 9,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        : ListView.builder(
+                            padding: const EdgeInsets.fromLTRB(10, 0, 10, 20),
+                            itemCount: visibleSongs.length,
+                            itemBuilder: (context, index) {
+                              final song = visibleSongs[index];
+
+                              final originalIndex = songs.indexOf(song);
+
+                              final selected =
+                                  originalIndex == currentSongIndex;
+
+                              final isFavorite =
+                                  _favorites.contains(song.file);
+
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 6),
+                                child: Material(
+                                  color: Colors.transparent,
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(11),
+                                    onTap: () {
+                                      Navigator.of(context).pop();
+
+                                      _selectSong(originalIndex);
+                                    },
+                                    child: AnimatedContainer(
+                                      duration:
+                                          const Duration(milliseconds: 180),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 11,
+                                        vertical: 11,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: selected
+                                            ? darkGreen
+                                            : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(11),
+                                        border: Border.all(
+                                          color: selected
+                                              ? green
+                                              : green.withAlpha(35),
+                                          width: selected ? 1.5 : 1,
+                                        ),
+                                      ),
+                                      child: Row(
+                                        children: [
+                                          // NÚMERO
+                                          Container(
+                                            width: 32,
+                                            height: 32,
+                                            alignment: Alignment.center,
+                                            decoration: BoxDecoration(
+                                              color: selected
+                                                  ? green.withAlpha(20)
+                                                  : darkerGreen,
+                                              borderRadius:
+                                                  BorderRadius.circular(7),
+                                            ),
+                                            child: Text(
+                                              selected
+                                                  ? '▶'
+                                                  : '${index + 1}'.padLeft(
+                                                      2,
+                                                      '0',
+                                                    ),
+                                              style: TextStyle(
+                                                fontFamily: 'Minecraftia',
+                                                color: green,
+                                                fontSize: 8,
+                                              ),
+                                            ),
+                                          ),
+
+                                          const SizedBox(width: 11),
+
+                                          // INFO
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  song.title,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontFamily: 'Minecraftia',
+                                                    color: green,
+                                                    fontSize: 9,
+                                                    fontWeight: selected
+                                                        ? FontWeight.bold
+                                                        : FontWeight.normal,
+                                                  ),
+                                                ),
+
+                                                const SizedBox(height: 5),
+
+                                                Text(
+                                                  song.artist,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontFamily: 'Minecraftia',
+                                                    color:
+                                                        green.withAlpha(150),
+                                                    fontSize: 7,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+
+                                          // FAVORITA
+IconButton(
+                                             onPressed: () async {
+                                               await _toggleFavorite(song.file);
+
+                                               setSheetState(() {});
+                                             },
+                                            splashRadius: 18,
+                                            icon: Icon(
+                                              isFavorite
+                                                  ? Icons.star
+                                                  : Icons.star_border,
+                                              size: 20,
+                                              color: isFavorite
+                                                  ? green
+                                                  : green.withAlpha(70),
+                                            ),
+                                          ),
+
+                                          // INDICADOR
+                                          if (selected)
+                                            Padding(
+                                              padding:
+                                                  const EdgeInsets.only(
+                                                left: 6,
+                                              ),
+                                              child: Icon(
+                                                Icons.equalizer,
+                                                color: green,
+                                                size: 18,
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
                   ),
                 ],
               ),
-
-              const SizedBox(height: 14),
-
-              // LISTA
-              Expanded(
-                child: ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(10, 0, 10, 20),
-                  itemCount: songs.length,
-                  itemBuilder: (context, index) {
-                    final song = songs[index];
-
-                    final selected = index == currentSongIndex;
-
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Material(
-                        color: Colors.transparent,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(11),
-                          onTap: () {
-                            _selectSong(index);
-                          },
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 180),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 11,
-                              vertical: 11,
-                            ),
-                            decoration: BoxDecoration(
-                              color: selected ? darkGreen : Colors.transparent,
-                              borderRadius: BorderRadius.circular(11),
-                              border: Border.all(
-                                color: selected ? green : green.withAlpha(35),
-                                width: selected ? 1.5 : 1,
-                              ),
-                            ),
-                            child: Row(
-                              children: [
-                                // NÚMERO
-                                Container(
-                                  width: 32,
-                                  height: 32,
-                                  alignment: Alignment.center,
-                                  decoration: BoxDecoration(
-                                    color: selected
-                                        ? green.withAlpha(20)
-                                        : darkerGreen,
-                                    borderRadius: BorderRadius.circular(7),
-                                  ),
-                                  child: Text(
-                                    selected
-                                        ? '▶'
-                                        : '${index + 1}'.padLeft(2, '0'),
-                                    style: const TextStyle(
-                                      fontFamily: 'Minecraftia',
-                                      color: green,
-                                      fontSize: 8,
-                                    ),
-                                  ),
-                                ),
-
-                                const SizedBox(width: 11),
-
-                                // INFO
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        song.title,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontFamily: 'Minecraftia',
-                                          color: green,
-                                          fontSize: 9,
-                                          fontWeight: selected
-                                              ? FontWeight.bold
-                                              : FontWeight.normal,
-                                        ),
-                                      ),
-
-                                      const SizedBox(height: 5),
-
-                                      Text(
-                                        song.artist,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontFamily: 'Minecraftia',
-                                          color: green.withAlpha(150),
-                                          fontSize: 7,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-
-                                // INDICADOR
-                                if (selected)
-                                  const Padding(
-                                    padding: EdgeInsets.only(left: 8),
-                                    child: Icon(
-                                      Icons.equalizer,
-                                      color: green,
-                                      size: 18,
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
+  }
+
+  Widget _playlistFilterChip({
+    required String label,
+    required bool active,
+    required VoidCallback onPressed,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(9),
+        onTap: onPressed,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          decoration: BoxDecoration(
+            color: active ? darkGreen : Colors.transparent,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(
+              color: active ? green : green.withAlpha(70),
+              width: active ? 1.5 : 1,
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontFamily: 'Minecraftia',
+              color: active ? green : green.withAlpha(150),
+              fontSize: 8,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _playlistTotalDuration() {
+    var total = Duration.zero;
+
+    for (final song in songs) {
+      final seconds = song.duration.inSeconds;
+
+      if (seconds > 0) {
+        total += Duration(seconds: seconds);
+      }
+    }
+
+    if (total == Duration.zero) {
+      return '--:--';
+    }
+
+    final m = total.inMinutes;
+    final h = total.inHours;
+
+    if (h > 0) {
+      return '${h}h${(m % 60).toString().padLeft(2, '0')}m';
+    }
+
+    return '${m}m';
   }
 
   // ============================================================
@@ -1690,6 +2469,465 @@ class _PlayerScreenState extends State<PlayerScreen> {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
       ),
     );
+  }
+
+  // ============================================================
+  // BOTÃO TEMA
+  // ============================================================
+
+  Widget _themeButton({bool compact = false}) {
+    return OutlinedButton.icon(
+      onPressed: _showThemePicker,
+      icon: const Icon(Icons.palette_outlined, size: 17),
+      label: const Text(
+        'TEMA',
+        style: TextStyle(fontFamily: 'Minecraftia', fontSize: 8),
+      ),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: green,
+        backgroundColor: Colors.black,
+        side: BorderSide(color: green.withAlpha(180), width: 1.5),
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 13 : 15,
+          vertical: compact ? 8 : 11,
+        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+      ),
+    );
+  }
+
+  Widget _albumCover({
+    required Song song,
+    required double size,
+    required bool showAction,
+    VoidCallback? onTap,
+    Color active = Colors.green,
+    double iconSize = 60,
+    int? cacheWidth,
+    double frameRadius = 22,
+    double outerPad = 4,
+    double innerPad = 2,
+    BoxShadow? shadow,
+    double innerRadius = 8,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: size + (outerPad * 2),
+        height: size + (outerPad * 2),
+        padding: EdgeInsets.all(outerPad),
+        decoration: BoxDecoration(
+          color: active,
+          borderRadius: BorderRadius.circular(frameRadius),
+          boxShadow: shadow != null
+              ? [shadow]
+              : [
+                  BoxShadow(
+                    color: active.withAlpha(35),
+                    blurRadius: 18,
+                    spreadRadius: 1,
+                  ),
+                ],
+        ),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: Container(
+                padding: EdgeInsets.all(innerPad),
+                decoration: BoxDecoration(
+                  color: Colors.black,
+                  borderRadius:
+                      BorderRadius.circular(frameRadius - innerRadius),
+                ),
+                child: ClipRRect(
+                  borderRadius:
+                      BorderRadius.circular(frameRadius - innerRadius - 3),
+                  child: song.cover != null
+                      ? Image.memory(
+                          song.cover!,
+                          fit: BoxFit.cover,
+                          filterQuality: FilterQuality.medium,
+                          cacheWidth: cacheWidth,
+                        )
+                      : Center(
+                          child: Icon(
+                            Icons.music_note,
+                            color: active,
+                            size: iconSize,
+                          ),
+                        ),
+                ),
+              ),
+            ),
+            if (showAction)
+              Positioned(
+                top: 6,
+                right: 6,
+                child: Container(
+                  padding: const EdgeInsets.all(5),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withAlpha(170),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: active.withAlpha(150)),
+                  ),
+                  child: Icon(
+                    Icons.fullscreen,
+                    color: active,
+                    size: 16,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _toggleFullscreen() {
+    final entering = !_fullscreen;
+
+    setState(() {
+      _fullscreen = entering;
+    });
+
+    SystemChrome.setEnabledSystemUIMode(
+      entering ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+  }
+
+  Widget _buildFullscreen(Song song) {
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black,
+        child: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final landscape = constraints.maxWidth > constraints.maxHeight;
+
+              final Widget cover = LayoutBuilder(
+                builder: (context, c) {
+                  final isLandscape = c.maxWidth > c.maxHeight;
+
+                  final size = c.biggest.shortestSide * 0.72;
+
+                  final horizontalSize =
+                      c.maxWidth * (isLandscape ? 0.5 : 0.72);
+
+                  final effectiveSize = isLandscape
+                      ? horizontalSize.clamp(140.0, 300.0)
+                      : size.clamp(200.0, 360.0);
+
+                  return Center(
+                    child: _albumCover(
+                      size: effectiveSize,
+                      song: song,
+                      active: green,
+                      showAction: false,
+                      onTap: _toggleFullscreen,
+                      iconSize: 78,
+                      cacheWidth: 1024,
+                      frameRadius: 28,
+                      outerPad: 6,
+                      innerPad: 3,
+                      innerRadius: 10,
+                      shadow: BoxShadow(
+                        color: green.withAlpha(60),
+                        blurRadius: 30,
+                        spreadRadius: 2,
+                      ),
+                    ),
+                  );
+                },
+              );
+
+              final details = _fullscreenPanel(
+                song: song,
+                compact: landscape,
+              );
+
+              final Widget body;
+
+              if (landscape) {
+                // Duas metades: capa à esquerda, controlos à direita.
+                body = Row(
+                  children: [
+                    Expanded(child: cover),
+                    Expanded(
+                      child: Center(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
+                          ),
+                          child: details,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              } else {
+                body = Column(
+                  children: [
+                    Expanded(child: cover),
+                    details,
+                  ],
+                );
+              }
+
+              return Stack(
+                children: [
+                  body,
+                  Positioned(
+                    top: 0,
+                    right: 0,
+                    child: IconButton(
+                      onPressed: _toggleFullscreen,
+                      tooltip: 'Sair da tela cheia',
+                      splashRadius: 20,
+                      icon: Icon(
+                        Icons.fullscreen_exit,
+                        color: green,
+                        size: 22,
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _fullscreenPanel({
+    required Song song,
+    required bool compact,
+  }) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: compact ? 6 : 18,
+          ),
+          child: Column(
+            children: [
+              RetroMarquee(
+                text: song.title,
+                active: isPlaying,
+                style: TextStyle(
+                  fontFamily: 'Minecraftia',
+                  color: green,
+                  fontSize: compact ? 14 : 15,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                song.artist,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontFamily: 'Minecraftia',
+                  color: green.withAlpha(150),
+                  fontSize: compact ? 9 : 10,
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        SizedBox(height: compact ? 10 : 12),
+
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18),
+          child: RetroSeekBar(
+            position: position,
+            duration: duration,
+            onSeek: _seek,
+            color: green,
+            labelWidth: 52,
+            barHeight: compact ? 18 : 24,
+          ),
+        ),
+
+        SizedBox(height: compact ? 10 : 14),
+
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            IconButton(
+              onPressed: _previousSong,
+              splashRadius: 26,
+              iconSize: compact ? 26 : 30,
+              icon: Icon(Icons.skip_previous, color: green),
+            ),
+            const SizedBox(width: 22),
+            Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: green, width: 2),
+              ),
+              child: IconButton(
+                onPressed: _togglePlay,
+                splashRadius: 34,
+                iconSize: compact ? 40 : 46,
+                padding: const EdgeInsets.all(16),
+                icon: Icon(
+                  isPlaying ? Icons.pause_circle : Icons.play_circle,
+                  color: green,
+                ),
+              ),
+            ),
+            const SizedBox(width: 22),
+            IconButton(
+              onPressed: _nextSong,
+              splashRadius: 26,
+              iconSize: compact ? 26 : 30,
+              icon: Icon(Icons.skip_next, color: green),
+            ),
+          ],
+        ),
+
+        SizedBox(height: compact ? 6 : 18),
+      ],
+    );
+  }
+
+  static const List<String> _themeNames = ['VERDE', 'ÂMBAR', 'CIANO', 'MAGENTA'];
+
+  void _showThemePicker() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return Container(
+          decoration: BoxDecoration(
+            color: Colors.black,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+            border: Border(
+              top: BorderSide(color: green, width: 2),
+              left: BorderSide(color: green, width: 1),
+              right: BorderSide(color: green, width: 1),
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 10),
+
+              Container(
+                width: 42,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: green,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              Text(
+                'TEMA DE COR',
+                style: TextStyle(
+                  fontFamily: 'Minecraftia',
+                  color: green,
+                  fontSize: 15,
+                  letterSpacing: 1,
+                ),
+              ),
+
+              const SizedBox(height: 14),
+
+              for (var i = 0; i < RetroColors.all.length; i++)
+                _themeOptionTile(index: i),
+
+              const SizedBox(height: 18),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _themeOptionTile({required int index}) {
+    final palette = RetroColors.all[index];
+
+    final selected = _palette == palette;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(11),
+          onTap: () {
+            Navigator.of(context).pop();
+
+            _applyTheme(index);
+          },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 12,
+            ),
+            decoration: BoxDecoration(
+              color: selected ? palette.dark : Colors.transparent,
+              borderRadius: BorderRadius.circular(11),
+              border: Border.all(
+                color: selected ? palette.primary : palette.primary.withAlpha(70),
+                width: selected ? 1.5 : 1,
+              ),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 22,
+                  height: 22,
+                  decoration: BoxDecoration(
+                    color: palette.primary,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: palette.primary.withAlpha(120),
+                      width: 1,
+                    ),
+                  ),
+                ),
+
+                const SizedBox(width: 12),
+
+                Expanded(
+                  child: Text(
+                    _themeNames[index],
+                    style: const TextStyle(
+                      fontFamily: 'Minecraftia',
+                      color: Colors.white,
+                      fontSize: 9,
+                    ),
+                  ),
+                ),
+
+                if (selected)
+                  Icon(Icons.check_circle, color: palette.primary, size: 15),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _applyTheme(int index) async {
+    final palette = RetroColors.all[index];
+
+    setState(() {
+      _palette = palette;
+    });
+
+    widget.palette?.value = palette;
+
+    await musicService.saveThemeIndex(index);
   }
 
   // ============================================================

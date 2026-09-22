@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:media_metadata/media_metadata.dart';
@@ -6,11 +7,25 @@ import 'package:saf/saf.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/song.dart';
+import '../utils/playlist.dart';
 
 class MusicService {
   final Saf saf = Saf();
 
   static const String folderKey = 'music_folder_uri';
+
+  static const String volumeKey = 'music_volume';
+
+  static const String themeIndexKey = 'theme_index';
+
+  static const String favoritesKey = 'favorites_list';
+
+  static const String lastSongIndexKey = 'last_song_index';
+
+  static const String lastPositionMsKey = 'last_position_ms';
+
+  // Número máximo de MP3 em cache. O mais antigo é apagado quando passa disso.
+  static const int maxCacheEntries = 20;
 
   // ============================================================
   // PASTA DE MÚSICAS
@@ -20,7 +35,6 @@ class MusicService {
     final prefs = SharedPreferencesAsync();
 
     await prefs.setString(folderKey, uri);
-
   }
 
   Future<String?> getSavedFolder() async {
@@ -29,24 +43,99 @@ class MusicService {
     return prefs.getString(folderKey);
   }
 
+  // ============================================================
+  // VOLUME
+  // ============================================================
+
+  Future<void> saveVolume(double volume) async {
+    final prefs = SharedPreferencesAsync();
+
+    await prefs.setDouble(volumeKey, volume);
+  }
+
+  Future<double> getVolume() async {
+    final prefs = SharedPreferencesAsync();
+
+    return (await prefs.getDouble(volumeKey)) ?? 1.0;
+  }
+
+  // ============================================================
+  // TEMA DE COR
+  // ============================================================
+
+  Future<int> getThemeIndex() async {
+    final prefs = SharedPreferencesAsync();
+
+    return (await prefs.getInt(themeIndexKey)) ?? 0;
+  }
+
+  Future<void> saveThemeIndex(int index) async {
+    final prefs = SharedPreferencesAsync();
+
+    await prefs.setInt(themeIndexKey, index);
+  }
+
+  // ============================================================
+  // FAVORITAS
+  // ============================================================
+
+  Future<List<String>> getFavorites() async {
+    final prefs = SharedPreferencesAsync();
+
+    return (await prefs.getStringList(favoritesKey)) ?? const [];
+  }
+
+  Future<bool> toggleFavorite(String file) async {
+    final list = toggleFavoriteInList(await getFavorites(), file);
+
+    final prefs = SharedPreferencesAsync();
+
+    await prefs.setStringList(favoritesKey, list);
+
+    return list.contains(file);
+  }
+
+  // ============================================================
+  // RETOMAR ONDE PAROU
+  // ============================================================
+
+  Future<int> getLastSongIndex() async {
+    final prefs = SharedPreferencesAsync();
+
+    return (await prefs.getInt(lastSongIndexKey)) ?? 0;
+  }
+
+  Future<void> saveLastSongIndex(int index) async {
+    final prefs = SharedPreferencesAsync();
+
+    await prefs.setInt(lastSongIndexKey, index);
+  }
+
+  Future<int> getLastPositionMs() async {
+    final prefs = SharedPreferencesAsync();
+
+    return (await prefs.getInt(lastPositionMsKey)) ?? 0;
+  }
+
+  Future<void> saveLastPositionMs(int milliseconds) async {
+    final prefs = SharedPreferencesAsync();
+
+    await prefs.setInt(lastPositionMsKey, milliseconds);
+  }
+
   Future<List<Song>> chooseMusicFolder() async {
-    try {
-      final directory = await saf.pickDirectory(
-        persistablePermission: true,
-        writePermission: false,
-      );
+    final directory = await saf.pickDirectory(
+      persistablePermission: true,
+      writePermission: false,
+    );
 
-      if (directory == null) {
-        return [];
-      }
-
-
-      await saveFolder(directory.uri);
-
-      return await loadSongsFromFolder(directory.uri);
-    } catch (e) {
+    if (directory == null) {
       return [];
     }
+
+    await saveFolder(directory.uri);
+
+    return await loadSongsFromFolder(directory.uri);
   }
 
   Future<List<Song>> loadSavedMusic() async {
@@ -56,18 +145,13 @@ class MusicService {
       return [];
     }
 
+    final exists = await saf.exists(savedUri);
 
-    try {
-      final exists = await saf.exists(savedUri);
-
-      if (!exists) {
-        return [];
-      }
-
-      return await loadSongsFromFolder(savedUri);
-    } catch (e) {
+    if (!exists) {
       return [];
     }
+
+    return await loadSongsFromFolder(savedUri);
   }
 
   // ============================================================
@@ -102,7 +186,6 @@ class MusicService {
           continue;
         }
 
-
         // Remove .mp3
         final filename = name.replaceFirst(
           RegExp(r'\.mp3$', caseSensitive: false),
@@ -113,7 +196,7 @@ class MusicService {
         // Extrair artista e título do nome
         // --------------------------------------------------------
 
-        final parsed = _parseFilename(filename);
+        final parsed = parseSongFilename(filename);
 
         songs.add(
           Song(title: parsed.title, artist: parsed.artist, file: file.uri),
@@ -127,114 +210,9 @@ class MusicService {
     // ORDENAR PLAYLIST
     // ==========================================================
 
-    songs.sort(_compareSongs);
-
-
-    for (var i = 0; i < songs.length; i++) {
-    }
+    songs.sort((a, b) => compareSongs(a.title, b.title));
 
     return songs;
-  }
-
-  // ============================================================
-  // EXTRAIR ARTISTA / TÍTULO
-  // ============================================================
-
-  _ParsedSong _parseFilename(String filename) {
-    // Procura:
-    //
-    // Artista - Título
-    //
-    final separatorIndex = filename.indexOf(' - ');
-
-    if (separatorIndex > 0) {
-      final artist = filename.substring(0, separatorIndex).trim();
-
-      final title = filename.substring(separatorIndex + 3).trim();
-
-      if (artist.isNotEmpty && title.isNotEmpty) {
-        return _ParsedSong(artist: artist, title: title);
-      }
-    }
-
-    // Se não tiver " - ", usamos o nome completo
-    // como título.
-    return _ParsedSong(artist: 'Desconhecido', title: filename.trim());
-  }
-
-  // ============================================================
-  // ORDENAR PLAYLIST
-  // ============================================================
-
-  int _compareSongs(Song a, Song b) {
-    final aNumber = _getTrackNumber(a.title);
-    final bNumber = _getTrackNumber(b.title);
-
-    // Ambas têm número
-    if (aNumber != null && bNumber != null) {
-      final result = aNumber.compareTo(bNumber);
-
-      if (result != 0) {
-        return result;
-      }
-    }
-
-    // Apenas A tem número
-    if (aNumber != null && bNumber == null) {
-      return -1;
-    }
-
-    // Apenas B tem número
-    if (aNumber == null && bNumber != null) {
-      return 1;
-    }
-
-    // Fallback
-    return a.title.toLowerCase().compareTo(b.title.toLowerCase());
-  }
-
-  int? _getTrackNumber(String title) {
-    final normalized = title.toLowerCase().trim();
-
-    // ----------------------------------------------------------
-    // Luv (sic) original
-    // ----------------------------------------------------------
-
-    if (RegExp(r'luv\s*\(sic\)\.?\s*$').hasMatch(normalized)) {
-      return 1;
-    }
-
-    // ----------------------------------------------------------
-    // Grand Finale
-    // ----------------------------------------------------------
-
-    if (normalized.contains('grand finale')) {
-      return 6;
-    }
-
-    // ----------------------------------------------------------
-    // pt2, pt3, pt4, pt5, pt6...
-    // ----------------------------------------------------------
-
-    final partMatch = RegExp(r'\bpt\s*(\d+)\b').firstMatch(normalized);
-
-    if (partMatch != null) {
-      final number = int.tryParse(partMatch.group(1)!);
-
-      if (number == null) {
-        return null;
-      }
-
-      // pt6 Uyama Hiroto Remix fica depois
-      // do Grand Finale.
-      if (number == 6) {
-        return 7;
-      }
-
-      return number;
-    }
-
-    return null;
   }
 
   // ============================================================
@@ -244,16 +222,16 @@ class MusicService {
   /// Só é executado quando a música é realmente aberta.
   ///
   /// Aqui:
-  /// 1. Copia para cache.
+  /// 1. Copia para cache (nome único baseado no URI, evita colisões).
   /// 2. Lê metadata.
   /// 3. Extrai capa.
   Future<Song> prepareSong(Song song) async {
     try {
       final tempDirectory = await getTemporaryDirectory();
 
-      final safeName = song.title.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+      final id = base64Url.encode(utf8.encode(song.file)).replaceAll('=', '');
 
-      final localPath = '${tempDirectory.path}/tsuki_$safeName.mp3';
+      final localPath = '${tempDirectory.path}/tsuki_$id.mp3';
 
       final localFile = File(localPath);
 
@@ -262,15 +240,12 @@ class MusicService {
       // --------------------------------------------------------
 
       if (!await localFile.exists()) {
-
         await saf.copyToLocalFile(song.file, localPath);
-      } else {
       }
 
       // --------------------------------------------------------
       // METADATA
       // --------------------------------------------------------
-
 
       final metadata = await MediaMetadata.read(localPath);
 
@@ -293,27 +268,86 @@ class MusicService {
 
       final cover = metadata?.imageMetadata?.data;
 
+      // --------------------------------------------------------
+      // LIMPAR CACHE ANTIGO
+      // --------------------------------------------------------
 
+      await _cleanupCache(keepPath: localPath);
 
       // --------------------------------------------------------
       // RESULTADO
       // --------------------------------------------------------
 
-      return Song(title: title, artist: artist, file: localPath, cover: cover);
+      return Song(
+        title: title,
+        artist: artist,
+        file: localPath,
+        cover: cover,
+        duration: metadata?.duration ?? Duration.zero,
+      );
     } catch (e) {
-
+      // Se falhar, devolve a música original; o áudio ainda pode tocar.
       return song;
+    }
+  }
+
+  // ============================================================
+  // LIMPAR CACHE
+  // ============================================================
+
+  /// Mantém no máximo [maxCacheEntries] MP3 em cache.
+  /// Apaga os mais antigos, exceto o que está a ser usado agora.
+  Future<void> _cleanupCache({required String keepPath}) async {
+    try {
+      final directory = await getTemporaryDirectory();
+
+      final files = directory
+          .listSync()
+          .whereType<File>()
+          .where(
+            (f) =>
+                f.path.contains('tsuki_') && f.path.endsWith('.mp3'),
+          )
+          .toList();
+
+      if (files.length <= maxCacheEntries) {
+        return;
+      }
+
+      files.sort((a, b) => a
+          .statSync()
+          .modified
+          .compareTo(b.statSync().modified));
+
+      while (files.length > maxCacheEntries) {
+        final oldest = files.removeAt(0);
+
+        if (oldest.path != keepPath) {
+          try {
+            oldest.deleteSync();
+          } catch (e) {
+            // Ignora ficheiros que não consegue apagar.
+          }
+        }
+      }
+    } catch (e) {
+      // Falha na limpeza nunca deve impedir a música de carregar.
     }
   }
 }
 
-// ============================================================
-// RESULTADO DO PARSER
-// ============================================================
+/// Alterna a presença de [file] na lista de favoritos.
+///
+/// Devolve uma NOVA lista (o input nunca é mutado) — importante porque o
+/// `SharedPreferencesAsync` devolve listas imodificáveis.
+List<String> toggleFavoriteInList(List<String> favorites, String file) {
+  final next = [...favorites];
 
-class _ParsedSong {
-  final String artist;
-  final String title;
+  if (next.contains(file)) {
+    next.remove(file);
+  } else {
+    next.add(file);
+  }
 
-  const _ParsedSong({required this.artist, required this.title});
+  return next;
 }

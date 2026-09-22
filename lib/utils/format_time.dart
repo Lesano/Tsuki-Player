@@ -1,8 +1,13 @@
-String formatTime(double seconds) {
-  int totalSeconds = seconds.toInt();
+String formatDuration(Duration time) {
+  final hours = time.inHours;
 
-  int minutes = totalSeconds ~/ 60;
-  int secs = totalSeconds % 60;
+  final minutes = time.inMinutes.remainder(60).toString().padLeft(2, '0');
 
-  return '$minutes:${secs.toString().padLeft(2, '0')}';
+  final seconds = time.inSeconds.remainder(60).toString().padLeft(2, '0');
+
+  if (hours > 0) {
+    return '$hours:$minutes:$seconds';
+  }
+
+  return '$minutes:$seconds';
 }
