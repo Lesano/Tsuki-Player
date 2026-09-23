@@ -282,7 +282,9 @@ Duration position = Duration.zero;
           DateTime.now().difference(_lastPositionSave).inSeconds >= 5) {
         _lastPositionSave = DateTime.now();
 
-        musicService.saveLastPositionMs(newPosition.inMilliseconds);
+        musicService
+            .saveLastPositionMs(newPosition.inMilliseconds)
+            .catchError((_) {});
       }
     });
 
@@ -294,7 +296,13 @@ Duration position = Duration.zero;
       state,
     ) async {
       if (state == ProcessingState.completed) {
-        await _nextSong(automatic: true);
+        try {
+          await _nextSong(automatic: true);
+        } catch (e) {
+          if (mounted) {
+            _showError('Não foi possível avançar a música.');
+          }
+        }
       }
     });
 
@@ -400,11 +408,13 @@ Duration position = Duration.zero;
   // CARREGAR MÚSICA
   // ============================================================
 
-  Future<void> _loadCurrentSong() async {
+  /// Carrega a faixa atual. Devolve `true` se o áudio foi
+  /// preparado com sucesso (para o chamador decidir se toca).
+  Future<bool> _loadCurrentSong() async {
     final song = currentSong;
 
     if (song == null || audioPlayer == null) {
-      return;
+      return false;
     }
 
     try {
@@ -432,7 +442,7 @@ Duration position = Duration.zero;
       }
 
       if (!mounted) {
-        return;
+        return false;
       }
 
       // Guarda metadata/capa na playlist.
@@ -479,7 +489,7 @@ Duration position = Duration.zero;
       );
 
       if (!mounted) {
-        return;
+        return false;
       }
 
       setState(() {
@@ -487,11 +497,15 @@ Duration position = Duration.zero;
         position = resumePosition ?? Duration.zero;
       });
 
+      return true;
+
     } catch (e) {
       // Mantém o player utilizável e avisa o utilizador.
       if (mounted) {
         _showError('Não foi possível carregar "${song.title}".');
       }
+
+      return false;
     }
   }
 
@@ -572,47 +586,53 @@ Duration position = Duration.zero;
       return;
     }
 
-    // Se já passou de 3 segundos, reinicia a música atual.
-    if (audioPlayer!.position.inSeconds >= 3) {
-      await audioPlayer!.seek(Duration.zero);
-      return;
-    }
+    try {
+      // Se já passou de 3 segundos, reinicia a música atual.
+      if (audioPlayer!.position.inSeconds >= 3) {
+        await audioPlayer!.seek(Duration.zero);
+        return;
+      }
 
-    // No modo aleatório, tenta voltar pelo histórico.
-    if (isShuffle && _shuffleHistoryPosition > 0) {
-      _shuffleHistoryPosition--;
+      // No modo aleatório, tenta voltar pelo histórico.
+      if (isShuffle && _shuffleHistoryPosition > 0) {
+        _shuffleHistoryPosition--;
 
-      final previousIndex =
-          _shuffleHistory[_shuffleHistoryPosition];
+        final previousIndex =
+            _shuffleHistory[_shuffleHistoryPosition];
+
+        if (mounted) {
+          setState(() {
+            currentSongIndex = previousIndex;
+          });
+        }
+
+        await _loadCurrentSong();
+
+        return;
+      }
+
+      if (currentSongIndex == 0) {
+        await audioPlayer!.seek(Duration.zero);
+        return;
+      }
+
+      final wasPlaying = audioPlayer!.playing;
 
       if (mounted) {
         setState(() {
-          currentSongIndex = previousIndex;
+          currentSongIndex--;
         });
       }
 
-      await _loadCurrentSong();
+      final loaded = await _loadCurrentSong();
 
-      return;
-    }
-
-    if (currentSongIndex == 0) {
-      await audioPlayer!.seek(Duration.zero);
-      return;
-    }
-
-    final wasPlaying = audioPlayer!.playing;
-
-    if (mounted) {
-      setState(() {
-        currentSongIndex--;
-      });
-    }
-
-    await _loadCurrentSong();
-
-    if (wasPlaying) {
-      await audioPlayer!.play();
+      if (wasPlaying && loaded) {
+        await audioPlayer!.play();
+      }
+    } catch (e) {
+      if (mounted) {
+        _showError('Não foi possível voltar à música anterior.');
+      }
     }
   }
 
@@ -625,13 +645,14 @@ Duration position = Duration.zero;
       return;
     }
 
-    // REPETIR UMA
-    // Quando a música termina, volta ao início da mesma faixa.
-    if (automatic && repeatMode == RepeatMode.one) {
-      await audioPlayer!.seek(Duration.zero);
-      await audioPlayer!.play();
-      return;
-    }
+    try {
+      // REPETIR UMA
+      // Quando a música termina, volta ao início da mesma faixa.
+      if (automatic && repeatMode == RepeatMode.one) {
+        await audioPlayer!.seek(Duration.zero);
+        await audioPlayer!.play();
+        return;
+      }
 
     int nextIndex = currentSongIndex;
 
@@ -702,11 +723,18 @@ Duration position = Duration.zero;
       });
     }
 
-    await _loadCurrentSong();
+    // Só toca a próxima se o áudio foi realmente carregado.
+    final loaded = await _loadCurrentSong();
 
-    // A próxima faixa toca automaticamente.
-    await audioPlayer!.play();
+    if (loaded) {
+      await audioPlayer!.play();
+    }
+  } catch (e) {
+    if (mounted) {
+      _showError('Não foi possível avançar a música.');
+    }
   }
+}
 
   // ============================================================
   // MODOS
@@ -841,7 +869,11 @@ Duration position = Duration.zero;
     }
 
     // Já pausado: apenas reinicia o estado.
-    await player?.pause();
+    try {
+      await player?.pause();
+    } catch (e) {
+      // Player indisponível: continua e reinicia o estado.
+    }
 
     _resetSleepState();
   }
@@ -854,27 +886,38 @@ Duration position = Duration.zero;
 
     var step = _sleepFadeSteps;
 
-    while (mounted && _sleepFadeActive && step > 0) {
-      await player?.setVolume(
-        fadeTargetVolume(originalVolume, step, _sleepFadeSteps),
-      );
+    try {
+      while (mounted && _sleepFadeActive && step > 0) {
+        await player?.setVolume(
+          fadeTargetVolume(originalVolume, step, _sleepFadeSteps),
+        );
 
-      step--;
+        step--;
 
-      if (step > 0 && _sleepFadeActive) {
-        await Future.delayed(_sleepFadeStepDuration);
+        if (step > 0 && _sleepFadeActive) {
+          await Future.delayed(_sleepFadeStepDuration);
+        }
+      }
+
+      // Fim do fade: pausa no volume 0 e só então restaura o volume original,
+      // para o ouvinte não ouvir a música "voltar ao normal" antes de parar.
+      if (step <= 0) {
+        await player?.setVolume(0.0);
+        await player?.pause();
+      }
+
+      // Restaura o volume original (silencioso, já pausado).
+      await player?.setVolume(originalVolume);
+    } catch (e) {
+      // Falha de áudio durante o fade não pode derrubar o app:
+      // garante pausa e restauração do volume.
+      try {
+        await player?.pause();
+        await player?.setVolume(originalVolume);
+      } catch (e2) {
+        // Silêncio: pior caso, o player já foi destruído.
       }
     }
-
-    // Fim do fade: pausa no volume 0 e só então restaura o volume original,
-    // para o ouvinte não ouvir a música "voltar ao normal" antes de parar.
-    if (step <= 0) {
-      await player?.setVolume(0.0);
-      await player?.pause();
-    }
-
-    // Restaura o volume original (silencioso, já pausado).
-    await player?.setVolume(originalVolume);
 
     _sleepFadeActive = false;
 
